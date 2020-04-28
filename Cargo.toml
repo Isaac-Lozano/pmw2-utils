@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "sf",
+    "nxf",
+    "pmw2_collada",
+]
