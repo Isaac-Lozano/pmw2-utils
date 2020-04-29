@@ -57,7 +57,10 @@ impl<W> Sf2Collada<W>
                     ScenePlacementData::Ground(SceneGeomFormat::Nxf) |
                     ScenePlacementData::GroundVU1(SceneGeomFormat::Nxf) |
                     ScenePlacementData::Sky(SceneGeomFormat::Nxf) => {
-                        self.writer.write(XmlEvent::start_element("node"))?;
+                        self.writer.write(
+                            XmlEvent::start_element("node")
+                                .attr("name", &placement.geom_name)
+                        )?;
                         self.writer.write(XmlEvent::start_element("translate"))?;
                         self.writer.write(format!("{} {} {}",
                             placement.x_pos,

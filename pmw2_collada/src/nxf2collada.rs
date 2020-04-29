@@ -449,7 +449,10 @@ impl<W> Nxf2Collada<W>
             XmlEvent::start_element("visual_scene")
                 .attr("id", "visual_scene")
         )?;
-        self.writer.write(XmlEvent::start_element("node"))?;
+        self.writer.write(
+            XmlEvent::start_element("node")
+                .attr("name", &self.name)
+        )?;
         self.writer.write(
             XmlEvent::start_element("instance_node")
                 .attr("url", "#main_node")
