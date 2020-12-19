@@ -1,5 +1,6 @@
 mod nxf2collada;
 mod sf2collada;
+mod matrix;
 
 use std::env;
 use std::error::Error;
@@ -64,6 +65,7 @@ fn main() {
     opts.optopt("", "sf", "SF input file", "FILE").long_only(true);
     opts.optopt("", "nxf", "NXF input file", "FILE").long_only(true);
     opts.optflag("h", "help", "print this help menu");
+    opts.optflag("p", "placements", "include placements (bounding boxes and points)");
     let matches = opts.parse(&args[1..])
         .map_err(|err| barf(&err.to_string()))
         .unwrap();
@@ -72,6 +74,8 @@ fn main() {
         print_help(program, opts);
         return;
     }
+
+    let include_placments = matches.opt_present("p");
 
     let out_filename = if !matches.free.is_empty() {
         matches.free[0].clone()
@@ -104,7 +108,7 @@ fn main() {
             let fout = File::create(out_filename).unwrap();
 
             let sf = SceneTemplate::from_read(fin).unwrap();
-            let mut converter = Sf2Collada::new(sf, fout);
+            let mut converter = Sf2Collada::new(sf, fout, include_placments);
             converter.write_collada().unwrap();
             println!("Successfully converted SF file to collada.");
         }
