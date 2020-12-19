@@ -1,52 +1,25 @@
-use std::io::{Read, Seek, SeekFrom, Error as IOError};
+use std::io::{Read, Seek, SeekFrom, Result as IoResult};
+use std::rc::Rc;
 
-use byteorder::{ReadBytesExt, BE};
-
-trait ReadFileExt: Seek {
-    type Err;
-    fn read_at_offset<T, F>(&mut self, offset: u64, f: F) -> Result<T, Self::Err>
-        where F: Fn(&mut Self) -> Result<T, Self::Err>;
-    fn read_string(&mut self) -> Result<String, Self::Err>;
-}
-
-impl<R> ReadFileExt for R
-    where R: Read + Seek,
-{
-    type Err = IOError;
-    fn read_at_offset<T, F>(&mut self, offset: u64, f: F) -> Result<T, Self::Err>
-        where F: Fn(&mut Self) -> Result<T, Self::Err>,
-    {
-        let saved_offset = self.seek(SeekFrom::Current(0))?;
-        self.seek(SeekFrom::Start(offset))?;
-        let result = f(self)?;
-        self.seek(SeekFrom::Start(saved_offset))?;
-        Ok(result)
-    }
-
-    fn read_string(&mut self) -> Result<String, Self::Err> {
-        let mut buffer = Vec::new();
-        let mut bytes = self.bytes();
-        loop {
-            if let Some(byte_res) = bytes.next() {
-                let byte = byte_res?;
-                if byte == 0 {
-                    break;
-                } else {
-                    buffer.push(byte);
-                }
-            } else {
-                break;
-            }
-        }
-        Ok(String::from_utf8(buffer).unwrap())
-    }
-}
+use binfile::de::{Deserializer, Deserialize};
+use binfile::shared_pointer::{
+    SharedPointerDeserializeState,
+    SharedPointer,
+    SharedPointed,
+};
+use binfile::single_pointer::{
+    SinglePointer,
+};
+use binfile::types::{
+    TerminatedString,
+    SizedList,
+};
 
 #[derive(Clone, Debug)]
 pub struct NxfMaterial {
     pub tex_pmi: u32,
     pub ref_pmi: u32,
-    pub tex_name: String,
+    pub tex_name: Rc<String>,
     pub ref_map: u32,
     pub ref_r: u8,
     pub ref_g: u8,
@@ -57,31 +30,33 @@ pub struct NxfMaterial {
     pub env_map_alpha_mode: u32,
 }
 
-impl NxfMaterial {
-    pub fn from_read<R>(mut read: R) -> Result<NxfMaterial, IOError>
-        where R: Read + Seek
+impl<'a> Deserialize<'a> for NxfMaterial {
+    type Output = Self;
+    type State = &'a mut SharedPointerDeserializeState<String>;
+
+    fn deserialize<R>(de: &mut Deserializer<R>, state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
-        let tex_pmi = read.read_u32::<BE>()?;
-        let ref_pmi = read.read_u32::<BE>()?;
+        let tex_pmi = de.read_u32()?;
+        let ref_pmi = de.read_u32()?;
 
-        let tex_name_offset = read.read_u32::<BE>()?;
-        let tex_name = read.read_at_offset(tex_name_offset as u64, |read| {
-            Ok(read.read_string()?)
-        })?;
+        let tex_name_shared = de.deserialize::<SharedPointer<TerminatedString>>((state, ()))?;
+        let tex_name = tex_name_shared;
 
-        let ref_map = read.read_u32::<BE>()?;
+        let ref_map = de.read_u32()?;
 
-        let ref_r = read.read_u8()?;
-        let ref_g = read.read_u8()?;
-        let ref_b = read.read_u8()?;
-        let ref_a = read.read_u8()?;
+        let ref_r = de.read_u8()?;
+        let ref_g = de.read_u8()?;
+        let ref_b = de.read_u8()?;
+        let ref_a = de.read_u8()?;
 
-        let flags = read.read_u32::<BE>()?;
-        let alpha_mode = read.read_u32::<BE>()?;
-        let env_map_alpha_mode = read.read_u32::<BE>()?;
+        let flags = de.read_u32()?;
+        let alpha_mode = de.read_u32()?;
+        let env_map_alpha_mode = de.read_u32()?;
 
-        let _pad1 = read.read_u32::<BE>()?;
-        let _pad2 = read.read_u32::<BE>()?;
+        let _pad1 = de.read_u32()?;
+        let _pad2 = de.read_u32()?;
 
         Ok(NxfMaterial {
             tex_pmi: tex_pmi,
@@ -97,18 +72,31 @@ impl NxfMaterial {
             env_map_alpha_mode: env_map_alpha_mode,
         })
     }
+}
 
-    pub fn list_from_read<R>(mut read: R, mut offset: u64) -> Result<Vec<NxfMaterial>, IOError>
-        where R: Read + Seek
+struct NxfMaterialListDeserializer;
+
+impl<'a> Deserialize<'a> for NxfMaterialListDeserializer {
+    type Output = Vec<Rc<NxfMaterial>>;
+    type State = (&'a mut SharedPointerDeserializeState<NxfMaterial>, &'a mut SharedPointerDeserializeState<String>);
+
+    fn deserialize<R>(de: &mut Deserializer<R>, state: Self::State) -> IoResult<Self::Output>
+    where
+        R: Read + Seek,
     {
-        let save = read.seek(SeekFrom::Current(0))?;
         let mut materials = Vec::new();
-        while offset != 0 {
-            read.seek(SeekFrom::Start(offset))?;
-            materials.push(NxfMaterial::from_read(&mut read)?);
-            offset = read.read_u32::<BE>()? as u64;
+        let mut data_addr = de.read_u32()? as u64;
+        let save_addr = de.inner().seek(SeekFrom::Current(0))?;
+
+        while data_addr != 0 {
+            de.inner().seek(SeekFrom::Start(data_addr))?;
+            let material = de.deserialize::<SharedPointer<NxfMaterial>>(state)?;
+            data_addr = de.read_u32()? as u64;
+            materials.push(material);
         }
-        read.seek(SeekFrom::Start(save))?;
+
+        de.inner().seek(SeekFrom::Start(save_addr))?;
+
         Ok(materials)
     }
 }
@@ -120,13 +108,17 @@ pub struct Vec3 {
     pub z: f32,
 }
 
-impl Vec3 {
-    pub fn from_read<R>(mut read: R) -> Result<Vec3, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for Vec3 {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
-        let x = read.read_f32::<BE>()?;
-        let y = read.read_f32::<BE>()?;
-        let z = read.read_f32::<BE>()?;
+        let x = de.read_f32()?;
+        let y = de.read_f32()?;
+        let z = de.read_f32()?;
 
         Ok(Vec3 {
             x: x,
@@ -144,14 +136,18 @@ pub struct Color {
     pub a: u8,
 }
 
-impl Color {
-    pub fn from_read<R>(mut read: R) -> Result<Color, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for Color {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
-        let r = read.read_u8()?;
-        let g = read.read_u8()?;
-        let b = read.read_u8()?;
-        let a = read.read_u8()?;
+        let r = de.read_u8()?;
+        let g = de.read_u8()?;
+        let b = de.read_u8()?;
+        let a = de.read_u8()?;
 
         Ok(Color {
             r: r,
@@ -168,12 +164,16 @@ pub struct Uv {
     pub v: f32,
 }
 
-impl Uv {
-    pub fn from_read<R>(mut read: R) -> Result<Uv, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for Uv {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
-        let u = read.read_f32::<BE>()?;
-        let v = read.read_f32::<BE>()?;
+        let u = de.read_f32()?;
+        let v = de.read_f32()?;
 
         Ok(Uv {
             u: u,
@@ -205,94 +205,50 @@ pub struct NxfArray {
     pub flags: u32,
 }
 
-impl NxfArray {
-    pub fn from_read<R>(mut read: R) -> Result<NxfArray, IOError>
-        where R: Read + Seek
+impl<'a> Deserialize<'a> for NxfArray {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
-        let min_x = read.read_f32::<BE>()?;
-        let min_y = read.read_f32::<BE>()?;
-        let min_z = read.read_f32::<BE>()?;
+        let min_x = de.read_f32()?;
+        let min_y = de.read_f32()?;
+        let min_z = de.read_f32()?;
 
-        let num_uvs = read.read_u32::<BE>()?;
+        let num_uvs = de.read_u32()?;
 
-        let max_x = read.read_f32::<BE>()?;
-        let max_y = read.read_f32::<BE>()?;
-        let max_z = read.read_f32::<BE>()?;
+        let max_x = de.read_f32()?;
+        let max_y = de.read_f32()?;
+        let max_z = de.read_f32()?;
 
-        let num_normals = read.read_u32::<BE>()?;
+        let num_normals = de.read_u32()?;
 
-        let c_x = read.read_f32::<BE>()?;
-        let c_y = read.read_f32::<BE>()?;
-        let c_z = read.read_f32::<BE>()?;
-        let radius = read.read_f32::<BE>()?;
+        let c_x = de.read_f32()?;
+        let c_y = de.read_f32()?;
+        let c_z = de.read_f32()?;
+        let radius = de.read_f32()?;
 
-        let num_verts = read.read_u32::<BE>()?;
-        let num_cols = read.read_u32::<BE>()?;
-        let max_verts = read.read_u32::<BE>()?;
-        let max_normals = read.read_u32::<BE>()?;
-        let max_cols = read.read_u32::<BE>()?;
-        let max_uvs = read.read_u32::<BE>()?;
+        let num_verts = de.read_u32()?;
+        let num_cols = de.read_u32()?;
+        let max_verts = de.read_u32()?;
+        let max_normals = de.read_u32()?;
+        let max_cols = de.read_u32()?;
+        let max_uvs = de.read_u32()?;
 
-        let verts_offset = read.read_u32::<BE>()?;
-        let verts = if verts_offset != 0 {
-            read.read_at_offset(verts_offset as u64, |mut read| {
-                let mut verts = Vec::new();
-                for _ in 0..num_verts {
-                    let vert = Vec3::from_read(&mut read)?;
-                    verts.push(vert);
-                }
-                Ok(verts)
-            })?
-        } else {
-            Vec::new()
-        };
+        let verts = de.deserialize::<SinglePointer<SizedList<Vec3>>>((num_verts as usize, ()))?;
 
-        let normals_offset = read.read_u32::<BE>()?;
-        let normals = if normals_offset != 0 {
-            read.read_at_offset(normals_offset as u64, |mut read| {
-                let mut normals = Vec::new();
-                for _ in 0..num_normals {
-                    let normal = Vec3::from_read(&mut read)?;
-                    normals.push(normal);
-                }
-                Ok(normals)
-            })?
-        } else {
-            Vec::new()
-        };
+        let normals = de.deserialize::<SinglePointer<SizedList<Vec3>>>((num_normals as usize, ()))?;
 
-        let colors_offset = read.read_u32::<BE>()?;
-        let colors = if colors_offset != 0 {
-            read.read_at_offset(colors_offset as u64, |mut read| {
-                let mut colors = Vec::new();
-                for _ in 0..num_cols {
-                    let color = Color::from_read(&mut read)?;
-                    colors.push(color);
-                }
-                Ok(colors)
-            })?
-        } else {
-            Vec::new()
-        };
+        let colors = de.deserialize::<SinglePointer<SizedList<Color>>>((num_cols as usize, ()))?;
 
-        let uvs_offset = read.read_u32::<BE>()?;
-        let uvs = if uvs_offset != 0 {
-            read.read_at_offset(uvs_offset as u64, |mut read| {
-                let mut uvs = Vec::new();
-                for _ in 0..num_uvs {
-                    let uv = Uv::from_read(&mut read)?;
-                    uvs.push(uv);
-                }
-                Ok(uvs)
-            })?
-        } else {
-            Vec::new()
-        };
+        let uvs = de.deserialize::<SinglePointer<SizedList<Uv>>>((num_uvs as usize, ()))?;
 
-        let flags = read.read_u32::<BE>()?;
+        let flags = de.read_u32()?;
 
-        let _pad1 = read.read_u32::<BE>()?;
-        let _pad2 = read.read_u32::<BE>()?;
+        let _pad1 = de.read_u32()?;
+        let _pad2 = de.read_u32()?;
 
         Ok(NxfArray {
             min_x: min_x,
@@ -331,20 +287,24 @@ pub struct NxfColLitTri {
     pub c2: u16,
 }
 
-impl NxfColLitTri {
-    pub fn from_read<R>(mut read: R) -> Result<NxfColLitTri, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for NxfColLitTri {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
         Ok(NxfColLitTri {
-            v0: read.read_u16::<BE>()?,
-            n0: read.read_u16::<BE>()?,
-            c0: read.read_u16::<BE>()?,
-            v1: read.read_u16::<BE>()?,
-            n1: read.read_u16::<BE>()?,
-            c1: read.read_u16::<BE>()?,
-            v2: read.read_u16::<BE>()?,
-            n2: read.read_u16::<BE>()?,
-            c2: read.read_u16::<BE>()?,
+            v0: de.read_u16()?,
+            n0: de.read_u16()?,
+            c0: de.read_u16()?,
+            v1: de.read_u16()?,
+            n1: de.read_u16()?,
+            c1: de.read_u16()?,
+            v2: de.read_u16()?,
+            n2: de.read_u16()?,
+            c2: de.read_u16()?,
         })
     }
 }
@@ -365,23 +325,27 @@ pub struct NxfTexLitTri {
     pub uv2: u16,
 }
 
-impl NxfTexLitTri {
-    pub fn from_read<R>(mut read: R) -> Result<NxfTexLitTri, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for NxfTexLitTri {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
         Ok(NxfTexLitTri {
-            v0: read.read_u16::<BE>()?,
-            n0: read.read_u16::<BE>()?,
-            c0: read.read_u16::<BE>()?,
-            uv0: read.read_u16::<BE>()?,
-            v1: read.read_u16::<BE>()?,
-            n1: read.read_u16::<BE>()?,
-            c1: read.read_u16::<BE>()?,
-            uv1: read.read_u16::<BE>()?,
-            v2: read.read_u16::<BE>()?,
-            n2: read.read_u16::<BE>()?,
-            c2: read.read_u16::<BE>()?,
-            uv2: read.read_u16::<BE>()?,
+            v0: de.read_u16()?,
+            n0: de.read_u16()?,
+            c0: de.read_u16()?,
+            uv0: de.read_u16()?,
+            v1: de.read_u16()?,
+            n1: de.read_u16()?,
+            c1: de.read_u16()?,
+            uv1: de.read_u16()?,
+            v2: de.read_u16()?,
+            n2: de.read_u16()?,
+            c2: de.read_u16()?,
+            uv2: de.read_u16()?,
         })
     }
 }
@@ -399,20 +363,24 @@ pub struct NxfTexUnlitTri {
     pub uv2: u16,
 }
 
-impl NxfTexUnlitTri {
-    pub fn from_read<R>(mut read: R) -> Result<NxfTexUnlitTri, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for NxfTexUnlitTri {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
         Ok(NxfTexUnlitTri {
-            v0: read.read_u16::<BE>()?,
-            c0: read.read_u16::<BE>()?,
-            uv0: read.read_u16::<BE>()?,
-            v1: read.read_u16::<BE>()?,
-            c1: read.read_u16::<BE>()?,
-            uv1: read.read_u16::<BE>()?,
-            v2: read.read_u16::<BE>()?,
-            c2: read.read_u16::<BE>()?,
-            uv2: read.read_u16::<BE>()?,
+            v0: de.read_u16()?,
+            c0: de.read_u16()?,
+            uv0: de.read_u16()?,
+            v1: de.read_u16()?,
+            c1: de.read_u16()?,
+            uv1: de.read_u16()?,
+            v2: de.read_u16()?,
+            c2: de.read_u16()?,
+            uv2: de.read_u16()?,
         })
     }
 }
@@ -427,17 +395,21 @@ pub struct NxfColUnlitTri {
     pub c2: u16,
 }
 
-impl NxfColUnlitTri {
-    pub fn from_read<R>(mut read: R) -> Result<NxfColUnlitTri, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for NxfColUnlitTri {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
         Ok(NxfColUnlitTri {
-            v0: read.read_u16::<BE>()?,
-            c0: read.read_u16::<BE>()?,
-            v1: read.read_u16::<BE>()?,
-            c1: read.read_u16::<BE>()?,
-            v2: read.read_u16::<BE>()?,
-            c2: read.read_u16::<BE>()?,
+            v0: de.read_u16()?,
+            c0: de.read_u16()?,
+            v1: de.read_u16()?,
+            c1: de.read_u16()?,
+            v2: de.read_u16()?,
+            c2: de.read_u16()?,
         })
     }
 }
@@ -461,26 +433,30 @@ pub struct NxfTexLitEnvTri {
     pub m2: u16,
 }
 
-impl NxfTexLitEnvTri {
-    pub fn from_read<R>(mut read: R) -> Result<NxfTexLitEnvTri, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for NxfTexLitEnvTri {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
         Ok(NxfTexLitEnvTri {
-            v0: read.read_u16::<BE>()?,
-            n0: read.read_u16::<BE>()?,
-            c0: read.read_u16::<BE>()?,
-            uv0: read.read_u16::<BE>()?,
-            m0: read.read_u16::<BE>()?,
-            v1: read.read_u16::<BE>()?,
-            n1: read.read_u16::<BE>()?,
-            c1: read.read_u16::<BE>()?,
-            uv1: read.read_u16::<BE>()?,
-            m1: read.read_u16::<BE>()?,
-            v2: read.read_u16::<BE>()?,
-            n2: read.read_u16::<BE>()?,
-            c2: read.read_u16::<BE>()?,
-            uv2: read.read_u16::<BE>()?,
-            m2: read.read_u16::<BE>()?,
+            v0: de.read_u16()?,
+            n0: de.read_u16()?,
+            c0: de.read_u16()?,
+            uv0: de.read_u16()?,
+            m0: de.read_u16()?,
+            v1: de.read_u16()?,
+            n1: de.read_u16()?,
+            c1: de.read_u16()?,
+            uv1: de.read_u16()?,
+            m1: de.read_u16()?,
+            v2: de.read_u16()?,
+            n2: de.read_u16()?,
+            c2: de.read_u16()?,
+            uv2: de.read_u16()?,
+            m2: de.read_u16()?,
         })
     }
 }
@@ -501,23 +477,27 @@ pub struct NxfColLitEnvTri {
     pub m2: u16,
 }
 
-impl NxfColLitEnvTri {
-    pub fn from_read<R>(mut read: R) -> Result<NxfColLitEnvTri, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for NxfColLitEnvTri {
+    type Output = Self;
+    type State = ();
+
+    fn deserialize<R>(de: &mut Deserializer<R>, _state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
         Ok(NxfColLitEnvTri {
-            v0: read.read_u16::<BE>()?,
-            n0: read.read_u16::<BE>()?,
-            c0: read.read_u16::<BE>()?,
-            m0: read.read_u16::<BE>()?,
-            v1: read.read_u16::<BE>()?,
-            n1: read.read_u16::<BE>()?,
-            c1: read.read_u16::<BE>()?,
-            m1: read.read_u16::<BE>()?,
-            v2: read.read_u16::<BE>()?,
-            n2: read.read_u16::<BE>()?,
-            c2: read.read_u16::<BE>()?,
-            m2: read.read_u16::<BE>()?,
+            v0: de.read_u16()?,
+            n0: de.read_u16()?,
+            c0: de.read_u16()?,
+            m0: de.read_u16()?,
+            v1: de.read_u16()?,
+            n1: de.read_u16()?,
+            c1: de.read_u16()?,
+            m1: de.read_u16()?,
+            v2: de.read_u16()?,
+            n2: de.read_u16()?,
+            c2: de.read_u16()?,
+            m2: de.read_u16()?,
         })
     }
 }
@@ -532,57 +512,66 @@ pub enum NxfFaces {
     ColLitEnvTri(Vec<NxfColLitEnvTri>),
 }
 
-impl NxfFaces {
-    pub fn from_read<R>(mut read: R, facelist_type: u8, num: u32) -> Result<NxfFaces, IOError>
-        where R: Read
+impl<'a> Deserialize<'a> for NxfFaces {
+    type Output = Self;
+    type State = (u8, u32);
+
+    fn deserialize<R>(de: &mut Deserializer<R>, state: Self::State) -> IoResult<Self>
+    where
+        R: Read + Seek,
     {
+        let facelist_type = state.0;
+        let num = state.1;
+
         match facelist_type {
             6 => {
                 let mut faces = Vec::new();
                 for _ in 0..num {
-                    faces.push(NxfColLitTri::from_read(&mut read)?);
+                    faces.push(de.deserialize::<NxfColLitTri>(())?);
                 }
                 Ok(NxfFaces::ColLitTri(faces))
             }
             8 => {
                 let mut faces = Vec::new();
                 for _ in 0..num {
-                    faces.push(NxfTexLitTri::from_read(&mut read)?);
+                    faces.push(de.deserialize::<NxfTexLitTri>(())?);
                 }
                 Ok(NxfFaces::TexLitTri(faces))
             }
             10 => {
                 let mut faces = Vec::new();
                 for _ in 0..num {
-                    faces.push(NxfTexUnlitTri::from_read(&mut read)?);
+                    faces.push(de.deserialize::<NxfTexUnlitTri>(())?);
                 }
                 Ok(NxfFaces::TexUnlitTri(faces))
             }
             11 => {
                 let mut faces = Vec::new();
                 for _ in 0..num {
-                    faces.push(NxfColUnlitTri::from_read(&mut read)?);
+                    faces.push(de.deserialize::<NxfColUnlitTri>(())?);
                 }
                 Ok(NxfFaces::ColUnlitTri(faces))
             }
             20 => {
                 let mut faces = Vec::new();
                 for _ in 0..num {
-                    faces.push(NxfTexLitEnvTri::from_read(&mut read)?);
+                    faces.push(de.deserialize::<NxfTexLitEnvTri>(())?);
                 }
                 Ok(NxfFaces::TexLitEnvTri(faces))
             }
             21 => {
                 let mut faces = Vec::new();
                 for _ in 0..num {
-                    faces.push(NxfColLitEnvTri::from_read(&mut read)?);
+                    faces.push(de.deserialize::<NxfColLitEnvTri>(())?);
                 }
                 Ok(NxfFaces::ColLitEnvTri(faces))
             }
             _ => panic!("Bad face type"),
         }
     }
+}
 
+impl NxfFaces {
     pub fn len(&self) -> usize {
         match self {
             NxfFaces::ColLitTri(faces) => faces.len(),
@@ -599,37 +588,35 @@ impl NxfFaces {
 pub struct NxfFacelist {
     pub flags: u16,
     pub attribs: u8,
-    pub material: NxfMaterial,
+    pub material: Rc<NxfMaterial>,
     pub faces: NxfFaces,
     next_facelist: u64, // XXX: needed (for now) so I can read a list of these
     pub display_list: u32,
     pub display_list_size: u32,
 }
 
-impl NxfFacelist {
-    pub fn from_read<R>(mut read: R) -> Result<NxfFacelist, IOError>
-        where R: Read + Seek
+impl<'a> Deserialize<'a> for NxfFacelist {
+    type Output = Self;
+    type State = (&'a mut SharedPointerDeserializeState<NxfMaterial>, &'a mut SharedPointerDeserializeState<String>);
+
+    fn deserialize<R>(de: &mut Deserializer<R>, state: Self::State) -> IoResult<Self::Output>
+    where
+        R: Read + Seek,
     {
-        let flags = read.read_u16::<BE>()?;
-        let facelist_type = read.read_u8()?;
-        let attribs = read.read_u8()?;
-        let _pad = read.read_u32::<BE>()?;
+        let flags = de.read_u16()?;
+        let facelist_type = de.read_u8()?;
+        let attribs = de.read_u8()?;
+        let _pad = de.read_u32()?;
 
-        let material_offset = read.read_u32::<BE>()? as u64;
-        let material = read.read_at_offset(material_offset, |mut read| {
-            NxfMaterial::from_read(&mut read)
-        })?;
+        let material = de.deserialize::<SharedPointer<NxfMaterial>>(state)?;
 
-        let num_faces = read.read_u32::<BE>()?;
-        let faces_offset = read.read_u32::<BE>()? as u64;
-        let faces = read.read_at_offset(faces_offset, |mut read| {
-            NxfFaces::from_read(&mut read, facelist_type, num_faces)
-        })?;
+        let num_faces = de.read_u32()?;
+        let faces = de.deserialize::<SinglePointer<NxfFaces>>((facelist_type, num_faces))?;
 
-        let next_facelist = read.read_u32::<BE>()? as u64;
+        let next_facelist = de.read_u32()? as u64;
 
-        let display_list = read.read_u32::<BE>()?;
-        let display_list_size = read.read_u32::<BE>()?;
+        let display_list = de.read_u32()?;
+        let display_list_size = de.read_u32()?;
 
         Ok(NxfFacelist {
             flags: flags,
@@ -641,19 +628,31 @@ impl NxfFacelist {
             display_list_size: display_list_size,
         })
     }
+}
 
-    pub fn list_from_read<R>(mut read: R, mut offset: u64) -> Result<Vec<NxfFacelist>, IOError>
-        where R: Read + Seek
+struct NxfFacelistListDeserializer;
+
+impl<'a> Deserialize<'a> for NxfFacelistListDeserializer {
+    type Output = Vec<NxfFacelist>;
+    type State = (&'a mut SharedPointerDeserializeState<NxfMaterial>, &'a mut SharedPointerDeserializeState<String>);
+
+    fn deserialize<R>(de: &mut Deserializer<R>, state: Self::State) -> IoResult<Self::Output>
+    where
+        R: Read + Seek,
     {
-        let save = read.seek(SeekFrom::Current(0))?;
         let mut facelists = Vec::new();
-        while offset != 0 {
-            read.seek(SeekFrom::Start(offset))?;
-            let facelist = NxfFacelist::from_read(&mut read)?;
-            offset = facelist.next_facelist;
+        let mut data_addr = de.read_u32()? as u64;
+        let save_addr = de.inner().seek(SeekFrom::Current(0))?;
+
+        while data_addr != 0 {
+            de.inner().seek(SeekFrom::Start(data_addr))?;
+            let facelist = de.deserialize::<NxfFacelist>((state.0, state.1))?;
+            data_addr = facelist.next_facelist;
             facelists.push(facelist);
         }
-        read.seek(SeekFrom::Start(save))?;
+
+        de.inner().seek(SeekFrom::Start(save_addr))?;
+
         Ok(facelists)
     }
 }
@@ -668,19 +667,22 @@ pub struct NxfFacelistSet {
     pub mat_palette: Option<NxfMatrixPalette>,
 }
 
-impl NxfFacelistSet {
-    pub fn from_read<R>(mut read: R) -> Result<NxfFacelistSet, IOError>
-        where R: Read + Seek
+impl<'a> Deserialize<'a> for NxfFacelistSet {
+    type Output = Self;
+    type State = (&'a mut SharedPointerDeserializeState<NxfMaterial>, &'a mut SharedPointerDeserializeState<String>);
+
+    fn deserialize<R>(de: &mut Deserializer<R>, state: Self::State) -> IoResult<Self::Output>
+    where
+        R: Read + Seek,
     {
-        let flags = read.read_u32::<BE>()?;
-        let _pad = read.read_u32::<BE>()?;
+        let flags = de.read_u32()?;
+        let _pad = de.read_u32()?;
 
-        let _num_lists = read.read_u32::<BE>()?;
-        let first_facelist = read.read_u32::<BE>()? as u64;
-        let facelists = NxfFacelist::list_from_read(&mut read, first_facelist)?;
+        let _num_lists = de.read_u32()?;
+        let facelists = de.deserialize::<NxfFacelistListDeserializer>(state)?;
 
-        // TODO: read mat palettes
-        let _mat_palette_offset = read.read_u32::<BE>()?;
+        // TODO: de.mat palettes
+        let _mat_palette_offset = de.read_u32()?;
 
         Ok(NxfFacelistSet {
             flags: flags,
@@ -688,19 +690,32 @@ impl NxfFacelistSet {
             mat_palette: None,
         })
     }
+}
 
-    pub fn list_from_read<R>(mut read: R, mut offset: u64) -> Result<Vec<NxfFacelistSet>, IOError>
-        where R: Read + Seek
+struct NxfFacelistSetListDeserializer;
+
+impl<'a> Deserialize<'a> for NxfFacelistSetListDeserializer {
+    type Output = Vec<NxfFacelistSet>;
+    type State = (&'a mut SharedPointerDeserializeState<NxfMaterial>, &'a mut SharedPointerDeserializeState<String>);
+
+    fn deserialize<R>(de: &mut Deserializer<R>, state: Self::State) -> IoResult<Self::Output>
+    where
+        R: Read + Seek,
     {
-        let save = read.seek(SeekFrom::Current(0))?;
-        let mut facelist_sets = Vec::new();
-        while offset != 0 {
-            read.seek(SeekFrom::Start(offset))?;
-            facelist_sets.push(NxfFacelistSet::from_read(&mut read)?);
-            offset = read.read_u32::<BE>()? as u64;
+        let mut facelistsets = Vec::new();
+        let mut data_addr = de.read_u32()? as u64;
+        let save_addr = de.inner().seek(SeekFrom::Current(0))?;
+
+        while data_addr != 0 {
+            de.inner().seek(SeekFrom::Start(data_addr))?;
+            let facelistset = de.deserialize::<NxfFacelistSet>((state.0, state.1))?;
+            data_addr = de.read_u32()? as u64;
+            facelistsets.push(facelistset);
         }
-        read.seek(SeekFrom::Start(save))?;
-        Ok(facelist_sets)
+
+        de.inner().seek(SeekFrom::Start(save_addr))?;
+
+        Ok(facelistsets)
     }
 }
 
@@ -712,58 +727,48 @@ pub struct NxfObjGeom {
     pub flags: u32,
     pub alpha_mode: u32,
     pub env_map_alpha_mode: u32,
-    pub strings: Vec<String>,
-    pub materials: Vec<NxfMaterial>,
+    pub strings: Vec<Rc<String>>,
+    pub materials: Vec<Rc<NxfMaterial>>,
     pub arrays: NxfArray,
     pub facelist_sets: Vec<NxfFacelistSet>,
     pub display_list: u32,
     pub display_list_size: u32,
 }
 
-impl NxfObjGeom {
-    pub fn from_read<R>(mut read: R) -> Result<NxfObjGeom, IOError>
-        where R: Read + Seek
+impl<'a> Deserialize<'a> for NxfObjGeom {
+    type Output = Self;
+    type State = (&'a mut SharedPointerDeserializeState<NxfMaterial>, &'a mut SharedPointerDeserializeState<String>);
+
+    fn deserialize<R>(de: &mut Deserializer<R>, state: Self::State) -> IoResult<Self::Output>
+    where
+        R: Read + Seek,
     {
         let mut id = [0; 4];
-        read.read_exact(&mut id)?;
-        let endian = read.read_u32::<BE>()?;
-        let version = read.read_f32::<BE>()?;
-        let flags = read.read_u32::<BE>()?;
-        let alpha_mode = read.read_u32::<BE>()?;
-        let env_map_alpha_mode = read.read_u32::<BE>()?;
+        de.inner().read_exact(&mut id)?;
+        let endian = de.read_u32()?;
+        let version = de.read_f32()?;
+        let flags = de.read_u32()?;
+        let alpha_mode = de.read_u32()?;
+        let env_map_alpha_mode = de.read_u32()?;
 
-        let num_strings = read.read_u16::<BE>()?;
-        let _pad = read.read_u16::<BE>()?;
-        let strings_offset = read.read_u32::<BE>()?;
-        let strings = read.read_at_offset(strings_offset as u64, |read| {
-            let mut strings = Vec::new();
-            for _ in 0..num_strings {
-                let string_offset = read.read_u32::<BE>()?;
-                let s = read.read_at_offset(string_offset as u64, |read| {
-                    Ok(read.read_string()?)
-                })?;
-                strings.push(s);
-            }
-            Ok(strings)
-        })?;
+        let num_strings = de.read_u16()? as usize;
+        let _pad = de.read_u16()?;
+        let strings_offset = de.read_u32()?;
+        let strings = de.deserialize::<SizedList<SharedPointer<TerminatedString>>>((num_strings, (state.1, ())))?;
 
-        let material_offset = read.read_u32::<BE>()?;
-        let materials = NxfMaterial::list_from_read(&mut read, material_offset as u64)?;
+        let material_offset = de.read_u32()?;
+        let materials = de.deserialize::<NxfMaterialListDeserializer>(state)?;
 
-        let arrays_offset = read.read_u32::<BE>()?;
-        let arrays = read.read_at_offset(arrays_offset as u64, |read| {
-            NxfArray::from_read(read)
-        })?;
+        let arrays = de.deserialize::<SinglePointer<NxfArray>>(())?;
 
-        let first_facelist_set = read.read_u32::<BE>()?;
-        let facelist_sets = NxfFacelistSet::list_from_read(&mut read, first_facelist_set as u64)?;
+        let facelist_sets = de.deserialize::<NxfFacelistSetListDeserializer>(state)?;
 
-        let display_list = read.read_u32::<BE>()?;
-        let display_list_size = read.read_u32::<BE>()?;
-        let _expanded = read.read_u32::<BE>()?; // TODO: read more geoms
-        let _pad1 = read.read_u32::<BE>()?;
-        let _pad2 = read.read_u32::<BE>()?;
-        let _pad3 = read.read_u32::<BE>()?;
+        let display_list = de.read_u32()?;
+        let display_list_size = de.read_u32()?;
+        let _expanded = de.read_u32()?; // TODO: read more geoms
+        let _pad1 = de.read_u32()?;
+        let _pad2 = de.read_u32()?;
+        let _pad3 = de.read_u32()?;
 
         Ok(NxfObjGeom {
             id: id,

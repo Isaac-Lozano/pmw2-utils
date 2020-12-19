@@ -1,5 +1,6 @@
 mod nxf2collada;
 mod sf2collada;
+mod matrix;
 
 use std::env;
 use std::error::Error;
